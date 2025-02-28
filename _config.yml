@@ -1,0 +1,47 @@
+# 사이트 기본 설정
+title: Keto's blog
+email: jsw5203@gmail.com
+description: >- 
+  hi
+baseurl: "" # 서브 경로가 있는 경우 "/blog"와 같이 설정
+url: "" # 도메인 주소 (예: "https://example.com")
+
+# 소셜 미디어 정보
+twitter_username: 
+github_username: 
+
+# 블로그 설정
+permalink: /:year/:month/:day/:title/
+paginate: 5
+paginate_path: "/page:num/"
+
+# 빌드 설정
+markdown: kramdown
+theme: minima
+plugins:
+  - jekyll-feed
+  - jekyll-paginate
+  - jekyll-seo-tag
+
+# 제외할 파일/폴더
+exclude:
+  - .sass-cache/
+  - .jekyll-cache/
+  - gemfiles/
+  - Gemfile
+  - Gemfile.lock
+  - node_modules/
+  - vendor/
+
+# 기본 레이아웃과 포맷
+defaults:
+  -
+    scope:
+      path: ""
+      type: "posts"
+    values:
+      layout: "post"
+      author: "Keto"
+
+# 검색 기능은 수동으로 구현
+# search.json 파일과 search.md 페이지를 별도로 생성해야 함

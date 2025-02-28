@@ -1,0 +1,15 @@
+---
+layout: null
+---
+{
+  "docs": [
+    {% for post in site.posts %}
+    {
+      "url": "{{ site.baseurl }}{{ post.url }}",
+      "title": "{{ post.title | escape }}",
+      "content": "{{ post.content | strip_html | strip_newlines | escape }}",
+      "date": "{{ post.date | date: "%Y-%m-%d" }}"
+    }{% unless forloop.last %},{% endunless %}
+    {% endfor %}
+  ]
+}
