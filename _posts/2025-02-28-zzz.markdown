@@ -1,0 +1,2053 @@
+---
+layout: post
+title: "Breaking Down Whale Browser's Password Storage"
+date: 2025-02-28 16:00:00 +0900
+categories: blog
+tags: [jekyll, 이미지]
+---
+# whale browser password
+
+![image.png](/assets/images/image%2020.png)
+
+login data를 찾아보니 password만 암호화 되어있다.
+
+문제에서 Chromium  오픈소스 기반에 DPAPI, AES를 사용한다고 했다.
+
+whale런처가 있고 그 내부에 C:\Program Files\Naver\Naver Whale\Application\4.29.282.14 에 있는 whale.exe가 진짜인 것 같다.
+
+크로미움에서 기능 몇개 추가한 정도라고 들었기에 크로미움 오픈소스를 봤다.
+
+components/password_manager/core/browser/password_store의 
+
+# **login_database.cc에서 비밀번호 넣는 부분**
+
+```c
+PasswordStoreChangeList LoginDatabase::AddLogin(const PasswordForm& form,
+                                                AddCredentialError* error) {
+  TRACE_EVENT0("passwords", "LoginDatabase::AddLogin");
+  absl::Cleanup is_empty_runner = [this] { TriggerIsEmptyCb(); };
+  if (error) {
+    *error = AddCredentialError::kNone;
+  }
+  if (!DoesMatchConstraints(form)) {
+    if (error) {
+      *error = AddCredentialError::kConstraintViolation;
+    }
+    return PasswordStoreChangeList();
+  }
+  PasswordForm form_to_add = form;
+#if BUILDFLAG(IS_IOS)
+  // [iOS] Passwords created in Credential Provider Extension (CPE) are already
+  // encrypted in the keychain and there is no need to do the process again.
+  // However, the password needs to be decrypted instead so the actual password
+  // syncs correctly.
+  bool has_encrypted_password =
+      !form.keychain_identifier.empty() && form.password_value.empty();
+  if (has_encrypted_password) {
+    std::u16string plaintext_password;
+    if (GetTextFromKeychainIdentifier(form.keychain_identifier,
+                                      &plaintext_password) != errSecSuccess) {
+      if (error) {
+        *error = AddCredentialError::kEncryptionServiceFailure;
+      }
+      return PasswordStoreChangeList();
+    }
+    form_to_add.password_value = plaintext_password;
+  } else {
+    if (!CreateKeychainIdentifier(form.password_value,
+                                  &form_to_add.keychain_identifier)) {
+      if (error) {
+        *error = AddCredentialError::kEncryptionServiceFailure;
+      }
+      return PasswordStoreChangeList();
+    }
+  }
+#else
+  CHECK(form.keychain_identifier.empty());
+#endif  // BUILDFLAG(IS_IOS)
+  std::string encrypted_password;
+  if (EncryptedString(form_to_add.password_value, &encrypted_password) !=
+      EncryptionResult::kSuccess) {
+    if (error) {
+      *error = AddCredentialError::kEncryptionServiceFailure;
+    }
+    return PasswordStoreChangeList();
+  }
+
+  PasswordStoreChangeList list;
+  DCHECK(!add_statement_.empty());
+  sql::Statement s(db_.GetCachedStatement(SQL_FROM_HERE, add_statement_));
+  BindAddStatement(form_to_add, &s, encrypted_password);
+  ScopedDbErrorHandler db_error_handler(&db_);
+  const bool success = s.Run();
+  if (success) {
+    // If success, the row never existed so password was not changed.
+    form_to_add.in_store = GetStore();
+    FormPrimaryKey primary_key = FormPrimaryKey(db_.GetLastInsertRowId());
+    form_to_add.primary_key = primary_key;
+    if (!form_to_add.password_issues.empty()) {
+      UpdateInsecureCredentials(primary_key, form_to_add.password_issues);
+    }
+    UpdatePasswordNotes(primary_key, form_to_add.notes);
+    list.emplace_back(PasswordStoreChange::ADD, std::move(form_to_add),
+                      /*password_changed=*/false);
+    return list;
+  }
+  // Repeat the same statement but with REPLACE semantic.
+  db_error_handler.reset_error_code();
+  DCHECK(!add_replace_statement_.empty());
+  PrimaryKeyAndPassword old_primary_key_password =
+      GetPrimaryKeyAndPassword(form);
+  bool password_changed =
+      form_to_add.password_value != old_primary_key_password.decrypted_password;
+  s.Assign(db_.GetCachedStatement(SQL_FROM_HERE, add_replace_statement_));
+  BindAddStatement(form_to_add, &s, encrypted_password);
+  if (s.Run()) {
+    form_to_add.in_store = GetStore();
+    PasswordForm removed_form = form_to_add;
+    removed_form.primary_key =
+        FormPrimaryKey(old_primary_key_password.primary_key);
+    list.emplace_back(PasswordStoreChange::REMOVE, removed_form);
+
+    FormPrimaryKey primary_key = FormPrimaryKey(db_.GetLastInsertRowId());
+    form_to_add.primary_key = primary_key;
+    InsecureCredentialsChanged insecure_changed(false);
+    if (!form_to_add.password_issues.empty()) {
+      insecure_changed =
+          UpdateInsecureCredentials(primary_key, form_to_add.password_issues);
+    }
+    UpdatePasswordNotes(primary_key, form_to_add.notes);
+    list.emplace_back(PasswordStoreChange::ADD, std::move(form_to_add),
+                      password_changed, insecure_changed);
+  } else if (error) {
+    if (db_error_handler.get_error_code() == 19 /*SQLITE_CONSTRAINT*/) {
+      *error = AddCredentialError::kConstraintViolation;
+    } else {
+      *error = AddCredentialError::kDbError;
+    }
+  }
+  return list;
+}
+```
+
+에서
+
+```c
+std::string encrypted_password;
+  if (EncryptedString(form_to_add.password_value, &encrypted_password) !=
+      EncryptionResult::kSuccess) {
+    if (error) {
+      *error = AddCredentialError::kEncryptionServiceFailure;
+    }
+    return PasswordStoreChangeList();
+  }
+```
+
+이부분에서 암호화가 되는 것으로 보인다.
+
+DecryptPassword 함수도 있다.
+
+```c
+EncryptionResult DecryptPasswordFromStatement(
+    sql::Statement& s,
+    std::u16string* plaintext_password,
+    EncryptDecryptInterface* decryptor) {
+  CHECK(plaintext_password);
+  std::string encrypted_password;
+  s.ColumnBlobAsString(COLUMN_PASSWORD_VALUE, &encrypted_password);
+  EncryptionResult encryption_result =
+      decryptor->DecryptedString(encrypted_password, plaintext_password);
+  if (encryption_result != EncryptionResult::kSuccess) {
+    DLOG(WARNING) << "Password decryption failed, encryption_result is "
+                  << static_cast<int>(encryption_result);
+  }
+  return encryption_result;
+}
+```
+
+Encrpyt랑 Decrpyt 함수가 어디있는 지 몰라 좀 찾았더니 
+
+components/os_crypt/sync/os_crypt_win.cc
+
+에서 찾을 수 있었다.
+
+```c
+// Copyright 2014 The Chromium Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include "components/os_crypt/sync/os_crypt.h"
+
+#include <windows.h>
+
+#include "base/base64.h"
+#include "base/check.h"
+#include "base/check_op.h"
+#include "base/containers/span.h"
+#include "base/feature_list.h"
+#include "base/logging.h"
+#include "base/memory/singleton.h"
+#include "base/metrics/histogram_functions.h"
+#include "base/metrics/histogram_macros.h"
+#include "base/strings/string_util.h"
+#include "base/strings/sys_string_conversions.h"
+#include "base/strings/utf_string_conversions.h"
+#include "base/win/wincrypt_shim.h"
+#include "components/prefs/pref_registry_simple.h"
+#include "components/prefs/pref_service.h"
+#include "components/version_info/version_info.h"
+#include "crypto/aead.h"
+#include "crypto/hkdf.h"
+#include "crypto/random.h"
+
+namespace {
+
+// Contains base64 random key encrypted with DPAPI.
+constexpr char kOsCryptEncryptedKeyPrefName[] = "os_crypt.encrypted_key";
+
+// Whether or not an attempt has been made to enable audit for the DPAPI
+// encryption backing the random key.
+constexpr char kOsCryptAuditEnabledPrefName[] = "os_crypt.audit_enabled";
+
+// AEAD key length in bytes.
+constexpr size_t kKeyLength = 256 / 8;
+
+// AEAD nonce length in bytes.
+constexpr size_t kNonceLength = 96 / 8;
+
+// Version prefix for data encrypted with profile bound key.
+constexpr char kEncryptionVersionPrefix[] = "v10";
+
+// Key prefix for a key encrypted with DPAPI.
+constexpr char kDPAPIKeyPrefix[] = "DPAPI";
+
+bool EncryptStringWithDPAPI(const std::string& plaintext,
+                            std::string* ciphertext) {
+  DATA_BLOB input;
+  input.pbData =
+      const_cast<BYTE*>(reinterpret_cast<const BYTE*>(plaintext.data()));
+  input.cbData = static_cast<DWORD>(plaintext.length());
+
+  BOOL result = FALSE;
+  DATA_BLOB output;
+  {
+    SCOPED_UMA_HISTOGRAM_TIMER("OSCrypt.Win.Encrypt.Time");
+    result = ::CryptProtectData(
+        /*pDataIn=*/&input,
+        /*szDataDescr=*/
+        base::SysUTF8ToWide(version_info::GetProductName()).c_str(),
+        /*pOptionalEntropy=*/nullptr,
+        /*pvReserved=*/nullptr,
+        /*pPromptStruct=*/nullptr, /*dwFlags=*/CRYPTPROTECT_AUDIT,
+        /*pDataOut=*/&output);
+  }
+  base::UmaHistogramBoolean("OSCrypt.Win.Encrypt.Result", result);
+  if (!result) {
+    PLOG(ERROR) << "Failed to encrypt";
+    return false;
+  }
+
+  // this does a copy
+  ciphertext->assign(reinterpret_cast<std::string::value_type*>(output.pbData),
+                     output.cbData);
+
+  LocalFree(output.pbData);
+  return true;
+}
+
+bool DecryptStringWithDPAPI(const std::string& ciphertext,
+                            std::string* plaintext) {
+  DATA_BLOB input;
+  input.pbData =
+      const_cast<BYTE*>(reinterpret_cast<const BYTE*>(ciphertext.data()));
+  input.cbData = static_cast<DWORD>(ciphertext.length());
+
+  BOOL result = FALSE;
+  DATA_BLOB output;
+  {
+    SCOPED_UMA_HISTOGRAM_TIMER("OSCrypt.Win.Decrypt.Time");
+    result = CryptUnprotectData(&input, nullptr, nullptr, nullptr, nullptr, 0,
+                                &output);
+  }
+  base::UmaHistogramBoolean("OSCrypt.Win.Decrypt.Result", result);
+  if (!result) {
+    PLOG(ERROR) << "Failed to decrypt";
+    return false;
+  }
+
+  plaintext->assign(reinterpret_cast<char*>(output.pbData), output.cbData);
+  LocalFree(output.pbData);
+  return true;
+}
+
+// Takes `key` and encrypts it with DPAPI, then stores it in the `local_state`.
+// Returns true if the key was successfully encrypted and stored.
+bool EncryptAndStoreKey(const std::string& key, PrefService* local_state) {
+  std::string encrypted_key;
+  if (!EncryptStringWithDPAPI(key, &encrypted_key)) {
+    return false;
+  }
+
+  // Add header indicating this key is encrypted with DPAPI.
+  encrypted_key.insert(0, kDPAPIKeyPrefix);
+  std::string base64_key = base::Base64Encode(encrypted_key);
+  local_state->SetString(kOsCryptEncryptedKeyPrefName, base64_key);
+  return true;
+}
+
+}  // namespace
+
+namespace OSCrypt {
+bool EncryptString16(const std::u16string& plaintext, std::string* ciphertext) {
+  return OSCryptImpl::GetInstance()->EncryptString16(plaintext, ciphertext);
+}
+bool DecryptString16(const std::string& ciphertext, std::u16string* plaintext) {
+  return OSCryptImpl::GetInstance()->DecryptString16(ciphertext, plaintext);
+}
+bool EncryptString(const std::string& plaintext, std::string* ciphertext) {
+  return OSCryptImpl::GetInstance()->EncryptString(plaintext, ciphertext);
+}
+bool DecryptString(const std::string& ciphertext, std::string* plaintext) {
+  return OSCryptImpl::GetInstance()->DecryptString(ciphertext, plaintext);
+}
+void RegisterLocalPrefs(PrefRegistrySimple* registry) {
+  OSCryptImpl::RegisterLocalPrefs(registry);
+}
+InitResult InitWithExistingKey(PrefService* local_state) {
+  return OSCryptImpl::GetInstance()->InitWithExistingKey(local_state);
+}
+bool Init(PrefService* local_state) {
+  return OSCryptImpl::GetInstance()->Init(local_state);
+}
+std::string GetRawEncryptionKey() {
+  return OSCryptImpl::GetInstance()->GetRawEncryptionKey();
+}
+void SetRawEncryptionKey(const std::string& key) {
+  OSCryptImpl::GetInstance()->SetRawEncryptionKey(key);
+}
+bool IsEncryptionAvailable() {
+  return OSCryptImpl::GetInstance()->IsEncryptionAvailable();
+}
+void UseMockKeyForTesting(bool use_mock) {
+  OSCryptImpl::GetInstance()->UseMockKeyForTesting(use_mock);
+}
+void SetLegacyEncryptionForTesting(bool legacy) {
+  OSCryptImpl::GetInstance()->SetLegacyEncryptionForTesting(legacy);
+}
+void ResetStateForTesting() {
+  OSCryptImpl::GetInstance()->ResetStateForTesting();
+}
+}  // namespace OSCrypt
+
+OSCryptImpl::OSCryptImpl() = default;
+OSCryptImpl::~OSCryptImpl() = default;
+
+OSCryptImpl* OSCryptImpl::GetInstance() {
+  return base::Singleton<OSCryptImpl,
+                         base::LeakySingletonTraits<OSCryptImpl>>::get();
+}
+
+bool OSCryptImpl::EncryptString16(const std::u16string& plaintext,
+                              std::string* ciphertext) {
+  return EncryptString(base::UTF16ToUTF8(plaintext), ciphertext);
+}
+
+bool OSCryptImpl::DecryptString16(const std::string& ciphertext,
+                              std::u16string* plaintext) {
+  std::string utf8;
+  if (!DecryptString(ciphertext, &utf8))
+    return false;
+
+  *plaintext = base::UTF8ToUTF16(utf8);
+  return true;
+}
+
+bool OSCryptImpl::EncryptString(const std::string& plaintext,
+                            std::string* ciphertext) {
+  if (use_legacy_)
+    return EncryptStringWithDPAPI(plaintext, ciphertext);
+
+  crypto::Aead aead(crypto::Aead::AES_256_GCM);
+
+  const auto key = GetRawEncryptionKey();
+  aead.Init(&key);
+
+  // Note: can only check these once AEAD is initialized.
+  DCHECK_EQ(kKeyLength, aead.KeyLength());
+  DCHECK_EQ(kNonceLength, aead.NonceLength());
+
+  std::string nonce(kNonceLength, '\0');
+  crypto::RandBytes(base::as_writable_byte_span(nonce));
+
+  if (!aead.Seal(plaintext, nonce, std::string(), ciphertext))
+    return false;
+
+  ciphertext->insert(0, nonce);
+  ciphertext->insert(0, kEncryptionVersionPrefix);
+  return true;
+}
+
+bool OSCryptImpl::DecryptString(const std::string& ciphertext,
+                            std::string* plaintext) {
+  if (!base::StartsWith(ciphertext, kEncryptionVersionPrefix,
+                        base::CompareCase::SENSITIVE))
+    return DecryptStringWithDPAPI(ciphertext, plaintext);
+
+  crypto::Aead aead(crypto::Aead::AES_256_GCM);
+
+  const auto key = GetRawEncryptionKey();
+  aead.Init(&key);
+
+  // Obtain the nonce.
+  const std::string nonce =
+      ciphertext.substr(sizeof(kEncryptionVersionPrefix) - 1, kNonceLength);
+  // Strip off the versioning prefix before decrypting.
+  const std::string raw_ciphertext =
+      ciphertext.substr(kNonceLength + (sizeof(kEncryptionVersionPrefix) - 1));
+
+  return aead.Open(raw_ciphertext, nonce, std::string(), plaintext);
+}
+
+// static
+void OSCryptImpl::RegisterLocalPrefs(PrefRegistrySimple* registry) {
+  registry->RegisterStringPref(kOsCryptEncryptedKeyPrefName, "");
+  registry->RegisterBooleanPref(kOsCryptAuditEnabledPrefName, false);
+}
+
+bool OSCryptImpl::Init(PrefService* local_state) {
+  // Try to pull the key from the local state.
+  switch (InitWithExistingKey(local_state)) {
+    case OSCrypt::kSuccess:
+      return true;
+    case OSCrypt::kKeyDoesNotExist:
+      break;
+    case OSCrypt::kInvalidKeyFormat:
+      return false;
+    case OSCrypt::kDecryptionFailed:
+      break;
+  }
+
+  // If there is no key in the local state, or if DPAPI decryption fails,
+  // generate a new key.
+  std::string key(kKeyLength, '\0');
+  crypto::RandBytes(base::as_writable_byte_span(key));
+
+  if (!EncryptAndStoreKey(key, local_state)) {
+    return false;
+  }
+
+  // This new key is already encrypted with audit flag enabled.
+  local_state->SetBoolean(kOsCryptAuditEnabledPrefName, true);
+
+  encryption_key_.assign(key);
+  return true;
+}
+
+OSCrypt::InitResult OSCryptImpl::InitWithExistingKey(PrefService* local_state) {
+  DCHECK(encryption_key_.empty()) << "Key already exists.";
+  // Try and pull the key from the local state.
+  if (!local_state->HasPrefPath(kOsCryptEncryptedKeyPrefName))
+    return OSCrypt::kKeyDoesNotExist;
+
+  const std::string base64_encrypted_key =
+      local_state->GetString(kOsCryptEncryptedKeyPrefName);
+  std::string encrypted_key_with_header;
+
+  base::Base64Decode(base64_encrypted_key, &encrypted_key_with_header);
+
+  if (!base::StartsWith(encrypted_key_with_header, kDPAPIKeyPrefix,
+                        base::CompareCase::SENSITIVE)) {
+    return OSCrypt::kInvalidKeyFormat;
+  }
+
+  const std::string encrypted_key =
+      encrypted_key_with_header.substr(sizeof(kDPAPIKeyPrefix) - 1);
+  std::string key;
+  // This DPAPI decryption can fail if the user's password has been reset
+  // by an Administrator.
+  if (!DecryptStringWithDPAPI(encrypted_key, &key)) {
+    base::UmaHistogramSparse("OSCrypt.Win.KeyDecryptionError",
+                             ::GetLastError());
+    return OSCrypt::kDecryptionFailed;
+  }
+
+  if (!local_state->GetBoolean(kOsCryptAuditEnabledPrefName)) {
+    // In theory, EncryptAndStoreKey could fail if DPAPI fails to encrypt, but
+    // DPAPI decrypted the old data fine. In this case it's better to leave the
+    // previously encrypted key, since the code has been able to decrypt it.
+    // Trying over and over makes no sense so the code explicitly does not
+    // attempt again, and audit will simply not be enabled in this case.
+    std::ignore = EncryptAndStoreKey(key, local_state);
+
+    // Indicate that an attempt has been made to turn audit flag on, so retry is
+    // not attempted.
+    local_state->SetBoolean(kOsCryptAuditEnabledPrefName, true);
+  }
+  encryption_key_.assign(key);
+  return OSCrypt::kSuccess;
+}
+
+void OSCryptImpl::SetRawEncryptionKey(const std::string& raw_key) {
+  DCHECK(!use_mock_key_) << "Mock key in use.";
+  DCHECK(!raw_key.empty()) << "Bad key.";
+  DCHECK(encryption_key_.empty()) << "Key already set.";
+  encryption_key_.assign(raw_key);
+}
+
+std::string OSCryptImpl::GetRawEncryptionKey() {
+  if (use_mock_key_) {
+    if (mock_encryption_key_.empty())
+      mock_encryption_key_.assign(
+          crypto::HkdfSha256("peanuts", "salt", "info", kKeyLength));
+    DCHECK(!mock_encryption_key_.empty()) << "Failed to initialize mock key.";
+    return mock_encryption_key_;
+  }
+
+  DCHECK(!encryption_key_.empty()) << "No key.";
+  return encryption_key_;
+}
+
+bool OSCryptImpl::IsEncryptionAvailable() {
+  if (use_mock_key_) {
+    return !GetRawEncryptionKey().empty();
+  }
+  return !encryption_key_.empty();
+}
+
+void OSCryptImpl::UseMockKeyForTesting(bool use_mock) {
+  use_mock_key_ = use_mock;
+}
+
+void OSCryptImpl::SetLegacyEncryptionForTesting(bool legacy) {
+  use_legacy_ = legacy;
+}
+
+void OSCryptImpl::ResetStateForTesting() {
+  use_legacy_ = false;
+  use_mock_key_ = false;
+  encryption_key_.clear();
+  mock_encryption_key_.clear();
+}
+```
+
+에서 EncryptString 따라가면
+
+```c
+bool OSCryptImpl::EncryptString(const std::string& plaintext,
+                            std::string* ciphertext) {
+  if (use_legacy_)
+    return EncryptStringWithDPAPI(plaintext, ciphertext);
+
+  crypto::Aead aead(crypto::Aead::AES_256_GCM);
+
+  const auto key = GetRawEncryptionKey();
+  aead.Init(&key);
+
+  // Note: can only check these once AEAD is initialized.
+  DCHECK_EQ(kKeyLength, aead.KeyLength());
+  DCHECK_EQ(kNonceLength, aead.NonceLength());
+
+  std::string nonce(kNonceLength, '\0');
+  crypto::RandBytes(base::as_writable_byte_span(nonce));
+
+  if (!aead.Seal(plaintext, nonce, std::string(), ciphertext))
+    return false;
+
+  ciphertext->insert(0, nonce);
+  ciphertext->insert(0, kEncryptionVersionPrefix);
+  return true;
+}
+
+```
+
+를 보면 use_legacy_라면 EncryptStringWithDPAPI로 가고 아니라면 다른 암호화 방식을 이용하는 것을 알 수 있다. 그러나 과제 설명에서 DPAPI라고 적혀있었기에 whale은 use_legacy_가 1이거나 옛날버전 크로미움을 사용하고 있을 것이다.
+
+함수를 따라가보면
+
+```c
+bool EncryptStringWithDPAPI(const std::string& plaintext,
+                            std::string* ciphertext) {
+  DATA_BLOB input;
+  input.pbData =
+      const_cast<BYTE*>(reinterpret_cast<const BYTE*>(plaintext.data()));
+  input.cbData = static_cast<DWORD>(plaintext.length());
+
+  BOOL result = FALSE;
+  DATA_BLOB output;
+  {
+    SCOPED_UMA_HISTOGRAM_TIMER("OSCrypt.Win.Encrypt.Time");
+    result = ::CryptProtectData(
+        /*pDataIn=*/&input,
+        /*szDataDescr=*/
+        base::SysUTF8ToWide(version_info::GetProductName()).c_str(),
+        /*pOptionalEntropy=*/nullptr,
+        /*pvReserved=*/nullptr,
+        /*pPromptStruct=*/nullptr, /*dwFlags=*/CRYPTPROTECT_AUDIT,
+        /*pDataOut=*/&output);
+  }
+  base::UmaHistogramBoolean("OSCrypt.Win.Encrypt.Result", result);
+  if (!result) {
+    PLOG(ERROR) << "Failed to encrypt";
+    return false;
+  }
+
+  // this does a copy
+  ciphertext->assign(reinterpret_cast<std::string::value_type*>(output.pbData),
+                     output.cbData);
+
+  LocalFree(output.pbData);
+  return true;
+}
+```
+
+가 나온다.
+
+input.pbData랑 input.cbData에 평문포인터와 길이를 넣고, 
+
+**CryptProtectData 함수(dpapi.h)**
+
+**CryptProtectData** 함수는 [DATA_BLOB](https://learn.microsoft.com/ko-kr/previous-versions/windows/desktop/legacy/aa381414(v=vs.85)) 구조의 데이터에 대한 암호화를 수행합니다. 일반적으로 데이터를 암호화한 사용자와 동일한 로그온 자격 증명을 가진 사용자만 데이터의 암호를 해독할 수 있습니다. 또한 암호화 및 암호 해독은 일반적으로 동일한 컴퓨터에서 수행해야 합니다. 예외에 대한 자세한 내용은 비고를 참조하세요.
+를 통해서 input에 있는걸 암호화해서 output에 넣는다.  이후
+
+ciphertext->assign(reinterpret_caststd::string::value_type*(output.pbData),
+output.cbData);
+
+를 통해 두번째 인자인 ciphertext에다가 넣어준다.
+
+**CryptProtectData**  설명을 보니 동일한 로그온 자격 증명을 가진 사용자만 할 수 있다고 한다.
+
+과제에는 그냥 복호화를 하라고만 해서 정확히 모르겠는데, 만약 동일한 로그온 자격 증명을 가졌다는  전제라면 그냥 decrypt 함수만 참고해도 복호화가 될 것이다.
+
+이제 구현되어있는 복호화 함수를 살펴보자.
+
+```c
+bool DecryptStringWithDPAPI(const std::string& ciphertext,
+                            std::string* plaintext) {
+  DATA_BLOB input;
+  input.pbData =
+      const_cast<BYTE*>(reinterpret_cast<const BYTE*>(ciphertext.data()));
+  input.cbData = static_cast<DWORD>(ciphertext.length());
+
+  BOOL result = FALSE;
+  DATA_BLOB output;
+  {
+    SCOPED_UMA_HISTOGRAM_TIMER("OSCrypt.Win.Decrypt.Time");
+    result = CryptUnprotectData(&input, nullptr, nullptr, nullptr, nullptr, 0,
+                                &output);
+  }
+  base::UmaHistogramBoolean("OSCrypt.Win.Decrypt.Result", result);
+  if (!result) {
+    PLOG(ERROR) << "Failed to decrypt";
+    return false;
+  }
+
+  plaintext->assign(reinterpret_cast<char*>(output.pbData), output.cbData);
+  LocalFree(output.pbData);
+  return true;
+}
+```
+
+**CryptUnprotectData** 함수는 암호를 해독하고 DATA_BLOB 구조에서 데이터의 [무결성](https://learn.microsoft.com/ko-kr/windows/desktop/SecGloss/i-gly)[검사](https://learn.microsoft.com/ko-kr/previous-versions/windows/desktop/legacy/aa381414(v=vs.85)) 수행합니다. 일반적으로 데이터를 해독할 수 있는 유일한 사용자는 데이터를 암호화한 사용자와 동일한 로그온 [자격 증명](https://learn.microsoft.com/ko-kr/windows/desktop/SecGloss/c-gly) 을 가진 사용자입니다. 또한 암호화 및 암호 해독은 동일한 컴퓨터에서 수행해야 합니다. 예외에 대한 자세한 내용은 [CryptProtectData](https://learn.microsoft.com/ko-kr/windows/desktop/api/dpapi/nf-dpapi-cryptprotectdata)의 설명 섹션을 참조하세요.
+
+바로 위에 있는 암호화와 거의 유사하다. **CryptUnprotectData가 사용되었다는것,** plaintext에 할당되는 것 빼고는 똑같다.
+
+분석은 다 했으니 이제 해야할 일은 다음과 같다.
+
+1. Login Data에서 password_value 필드를 파싱하기
+2. DecryptStringWithDPAPI를 컨버팅하기
+3. 포팅한 함수에 input으로 파싱한 데이터를 넣기
+
+를 했는데 legacy가 아닌 것 같다. 형식 자체가 안맞음.
+
+DPAPI로 AES키를 암호화하고 AES로 암호화 하는 방식인 것으로 보인다.
+
+```c
+bool OSCryptImpl::EncryptString(const std::string& plaintext,
+                            std::string* ciphertext) {
+  if (use_legacy_)
+    return EncryptStringWithDPAPI(plaintext, ciphertext);
+
+  crypto::Aead aead(crypto::Aead::AES_256_GCM);
+
+  const auto key = GetRawEncryptionKey();
+  aead.Init(&key);
+
+  // Note: can only check these once AEAD is initialized.
+  DCHECK_EQ(kKeyLength, aead.KeyLength());
+  DCHECK_EQ(kNonceLength, aead.NonceLength());
+
+  std::string nonce(kNonceLength, '\0');
+  crypto::RandBytes(base::as_writable_byte_span(nonce));
+
+  if (!aead.Seal(plaintext, nonce, std::string(), ciphertext))
+    return false;
+
+  ciphertext->insert(0, nonce);
+  ciphertext->insert(0, kEncryptionVersionPrefix);
+  return true;
+}
+```
+
+GetRawEncryptionKey()를 통해 key를 가져오고, 
+
+  std::string nonce(kNonceLength, '\0');로 IV만들고
+
+aead.Seal(plaintext, nonce, std::string(), ciphertext)로 AES를 돌린다.
+
+그런 다음 ciphertext->insert(0, nonce);
+  ciphertext->insert(0, kEncryptionVersionPrefix);
+
+를 하게 된다.
+
+따라서 전체 구조는
+
+버전 |  IV | enc 가 된다.
+
+처음에 나오는 숫자인  77 31 31이 w11로 whale 의 버전이고 그 뒤 12바이트는 랜덤값, 그 이외에는 암호화된 값으로 보인다.
+
+,"encrypted_key":"RFBBUEkBAAAA0Iyd3wEV0RGMegDAT8KX6wEAAAAofUpGu3h6R6sIRRb7kMoIEAAAAAwAAABXAGgAYQBsAGUAAAAQZgAAAAEAACAAAADUwTfBPmKGda4jYWYgYMcLlOlRuqBrHksJUYV8tCM5HgAAAAAOgAAAAAIAACAAAACWSBRxLRg99Yo7eNEo3k+Q4Yz3ciwTSWI/g2MmEK4giTAAAADrT0RB/VhV1mENukWdS010fzWgbUtM8ak3hltFOnnuW+cGUoXDgWG8uijkGUHCnL5AAAAASaxuZPypkmDWqQ18PF2NN0J1kWteLjFaexQfDBEZMbsOymyJn6I6Nmcv8feByrkMUgt8Ebqng070Kzi6ycUWsw==
+
+로 일단 되어있고 base64디코딩하고 앞에 붙은 DPAPI를 빼주고 복호화 가능.
+
+버전은 3바이트
+
+IV는 12바이트
+
+태그는 16바이트
+
+그럼 31+평문길이여야하는데 그게 아니다.
+
+즉 whale에서 암호화 알고리즘을 AES-GCM이 아니라 다른걸 사용했음.
+
+정말 열심히 찾다보니 whale.dll에서 뭔가를 찾았다.
+
+LoginDatabase::AddLogin 부분 함수에서 이름들 실제 코드처럼 수정함.
+
+```python
+__int64 __fastcall sub_1850F5410(__int64 a1, __int64 a2, __int64 form, _DWORD *error)
+{
+  __int64 v8; // rax
+  __int64 v9; // rax
+  __int64 v10; // rax
+  __int64 v12; // rax
+  __int64 *v13; // r12
+  __int64 v14; // rax
+  __int64 v15; // rcx
+  __int64 *v16; // rbp
+  unsigned int v17; // eax
+  unsigned int v18; // ebx
+  __int64 v19; // r15
+  __int64 v20; // r12
+  unsigned __int64 v21; // rbx
+  __int64 v22; // rbx
+  __int64 v23; // rax
+  __int64 v24; // r8
+  __int64 *v25; // rdx
+  __int64 v26; // rcx
+  __int64 v27; // rax
+  __int64 v28; // rcx
+  unsigned __int64 v29; // rbx
+  __int64 v30; // rbx
+  unsigned int v31; // eax
+  unsigned int v32; // ebx
+  char v33; // r12
+  __int64 v34; // r15
+  __int64 v35; // r13
+  unsigned __int64 v36; // rbx
+  __int64 v37; // rbx
+  _BYTE v38[32]; // [rsp+0h] [rbp-1898h] BYREF
+  __int64 v39; // [rsp+20h] [rbp-1878h]
+  char v40; // [rsp+2Bh] [rbp-186Dh] BYREF
+  unsigned int v41; // [rsp+2Ch] [rbp-186Ch] BYREF
+  __int64 v42[2]; // [rsp+30h] [rbp-1868h] BYREF
+  __int128 v43; // [rsp+40h] [rbp-1858h] BYREF
+  __int64 v44; // [rsp+50h] [rbp-1848h] BYREF
+  char v45; // [rsp+5Fh] [rbp-1839h] BYREF
+  __int64 v46[8]; // [rsp+60h] [rbp-1838h] BYREF
+  __int128 v47; // [rsp+A0h] [rbp-17F8h] BYREF
+  __int64 v48[2]; // [rsp+B8h] [rbp-17E0h] BYREF
+  __int128 v49; // [rsp+C8h] [rbp-17D0h] BYREF
+  __int64 v50; // [rsp+D8h] [rbp-17C0h] BYREF
+  __int128 v51; // [rsp+E0h] [rbp-17B8h] BYREF
+  __int128 encrypted_password; // [rsp+F0h] [rbp-17A8h] BYREF
+  __int64 v53; // [rsp+100h] [rbp-1798h]
+  int v54; // [rsp+110h] [rbp-1788h] BYREF
+  char v55; // [rsp+114h] [rbp-1784h]
+  __int64 from_to_add[78]; // [rsp+8C8h] [rbp-FD0h] BYREF
+  __int64 v57[2]; // [rsp+B38h] [rbp-D60h] BYREF
+  char v58; // [rsp+B4Fh] [rbp-D49h]
+  int v59; // [rsp+F64h] [rbp-934h]
+  unsigned int *v60; // [rsp+F80h] [rbp-918h] BYREF
+  unsigned int *v61; // [rsp+F88h] [rbp-910h]
+  __int64 v62; // [rsp+F98h] [rbp-900h]
+  __int64 v63; // [rsp+FA0h] [rbp-8F8h]
+  __int16 v64[988]; // [rsp+1080h] [rbp-818h] BYREF
+  __int64 v65; // [rsp+1838h] [rbp-60h]
+
+  from_to_add[0] = 108LL;
+  if ( byte_18E15D56C )
+  {
+    *(_QWORD *)v64 = "LoginDatabase::AddLogin";
+    sub_1819B1270((unsigned __int8)byte_18E15D56C, from_to_add, (__int64)v64, 1);
+  }
+  if ( error )
+    *error = 0;
+  if ( !(unsigned __int8)dismatch(form + 16) )
+  {
+    v8 = *(char *)(form + 63);
+    if ( v8 < 0 )
+      v8 = *(_QWORD *)(form + 48);
+    if ( !v8 )
+      goto LABEL_16;
+  }
+  v9 = *(char *)(form + 39);
+  if ( v9 < 0 )
+    v9 = *(_QWORD *)(form + 24);
+  if ( !v9 )
+    goto LABEL_16;
+  v10 = *(char *)(form + 63);
+  if ( v10 < 0 )
+    v10 = *(_QWORD *)(form + 48);
+  if ( v10 && *(_BYTE *)(form + 64) != 1 )      // (!DoesMatchConstraints(form))
+  {
+LABEL_16:
+    if ( error )
+      *error = 2;                               //  *error = AddCredentialError::kConstraintViolation;
+                                                //  
+    *(_OWORD *)a2 = 0LL;
+    *(_QWORD *)(a2 + 16) = 0LL;
+    goto LABEL_19;
+  }
+  sub_1827283F0((__int64)from_to_add, 0xAAu, 0x7B8uLL);
+  sub_1850D1A60((__int64)from_to_add, form);
+  v12 = *(char *)(form + 671);                  // check 어쩌고
+  if ( v12 < 0 )
+    v12 = *(_QWORD *)(form + 656);
+  if ( v12 )
+  {
+    __debugbreak();
+    BUG();
+  }
+  encrypted_password = 0LL;
+  v53 = 0LL;
+  v13 = v57;
+  if ( !(unsigned int)EncryptedString(a1, (__int64)v57, (__int64)&encrypted_password) )// 아마 이부분임
+  {
+    *(_OWORD *)a2 = 0LL;
+    *(_QWORD *)(a2 + 16) = 0LL;
+    v14 = a1 + 304;
+    v51 = xmmword_18C609AE0;
+    v15 = *(char *)(a1 + 327);
+    if ( v15 < 0 )
+      v14 = *(_QWORD *)(a1 + 304);
+    *(_QWORD *)&v49 = v14;
+    if ( v15 < 0 )
+      v15 = *(_QWORD *)(a1 + 312);
+    *((_QWORD *)&v49 + 1) = v15;
+    v48[0] = (__int64)"..\\..\\components\\password_manager\\core\\browser\\password_store\\login_database.cc";
+    v48[1] = 1398LL;
+    v16 = &v50;
+    sub_180E627F0((_QWORD *)(a1 + 56), &v50, v48, &v49);
+    sub_180EC4C90(&v51, v50);
+    sub_1850F5C30(from_to_add, &v51, &encrypted_password);
+    v47 = xmmword_18C609AE0;
+    sub_1850F6350(&v47, a1 + 56);
+    if ( (unsigned __int8)sub_1812E47A0(&v51) )
+    {
+      v59 = *(unsigned __int8 *)(a1 + 32) + 1;
+      v17 = sub_186BA45E0(a1 + 56);
+      v18 = v17;
+      if ( !BYTE4(from_to_add[0]) )
+        BYTE4(from_to_add[0]) = 1;
+      LODWORD(from_to_add[0]) = v17;
+      if ( v60 != v61 )
+        sub_1850F63F0(a1, (char *)v64, v17, &v60);
+      sub_1850FFD60((_QWORD *)(a1 + 248), v18);
+      v19 = v62;
+      v20 = v63;
+      while ( v19 != v20 )
+      {
+        sub_1850FFB50(a1 + 248, v18, v19);
+        v19 += 64LL;
+      }
+      LOBYTE(v46[0]) = 0;
+      v54 = 0;
+      v21 = *(_QWORD *)(a2 + 8);
+      if ( v21 >= *(_QWORD *)(a2 + 16) )
+      {
+        v22 = sub_1850FC5F0(a2, &v54, from_to_add, v46);
+        goto LABEL_51;
+      }
+      if ( v21 )
+      {
+        sub_1850D20A0(v64, from_to_add);
+        LOBYTE(v39) = 0;
+        sub_1850D5F70(v21, 0LL, v64, 0LL, v39);
+        v22 = v21 + 1992;
+LABEL_51:
+        *(_QWORD *)(a2 + 8) = v22;
+LABEL_52:
+        sub_181BE0CD0(v47 + 104);
+        if ( (v47 & 0xFFFFFFFC00000000uLL) == qword_18E073C48 )
+          sub_1800020A0(v47);
+        sub_180C4F7F0(&v51);
+        goto LABEL_33;
+      }
+LABEL_100:
+      BUG();
+    }
+    DWORD2(v47) = 0;
+    memset(v46, 170, 56);
+    sub_1850F6540(a1, v46, form);
+    v23 = SHIBYTE(v46[3]);
+    if ( v46[3] < 0 )
+      v23 = v46[2];
+    v24 = v58;
+    if ( v58 < 0LL )
+      v24 = v57[1];
+    LOBYTE(v16) = 1;
+    if ( v24 == v23 )
+    {
+      if ( v23 )
+      {
+        if ( v46[3] < 0 )
+          v25 = (__int64 *)v46[1];
+        else
+          v25 = &v46[1];
+        if ( v58 < 0 )
+          v13 = (__int64 *)v57[0];
+        v26 = 0LL;
+        while ( *((_WORD *)v25 + v26) == *((_WORD *)v13 + v26) )
+        {
+          if ( v23 == ++v26 )
+            goto LABEL_69;
+        }
+      }
+      else
+      {
+LABEL_69:
+        LODWORD(v16) = 0;
+      }
+    }
+    v45 = (char)v16;
+    v27 = a1 + 328;
+    v28 = *(char *)(a1 + 351);
+    if ( v28 < 0 )
+      v27 = *(_QWORD *)(a1 + 328);
+    *(_QWORD *)&v43 = v27;
+    if ( v28 < 0 )
+      v28 = *(_QWORD *)(a1 + 336);
+    *((_QWORD *)&v43 + 1) = v28;
+    v42[0] = (__int64)"..\\..\\components\\password_manager\\core\\browser\\password_store\\login_database.cc";
+    v42[1] = 1422LL;
+    sub_180E627F0((_QWORD *)(a1 + 56), &v44, v42, &v43);
+    sub_1812E4750(&v51, v44);
+    sub_1850F5C30(from_to_add, &v51, &encrypted_password);
+    if ( (unsigned __int8)sub_1812E47A0(&v51) )
+    {
+      v59 = *(unsigned __int8 *)(a1 + 32) + 1;
+      sub_1827283F0((__int64)&v54, 0xAAu, 0x7B8uLL);
+      sub_1850D1A60((__int64)&v54, (__int64)from_to_add);
+      if ( !v55 )
+        v55 = 1;
+      v54 = v46[0];
+      v41 = 2;
+      v29 = *(_QWORD *)(a2 + 8);
+      if ( v29 >= *(_QWORD *)(a2 + 16) )
+      {
+        v30 = sub_1850FC790(a2, &v41, &v54);
+      }
+      else
+      {
+        if ( !v29 )
+          goto LABEL_100;
+        sub_1850D1A60((__int64)v64, (__int64)&v54);
+        sub_1850D5F30(v29, v41, v64);
+        v30 = v29 + 1992;
+      }
+      *(_QWORD *)(a2 + 8) = v30;
+      v31 = sub_186BA45E0(a1 + 56);
+      v32 = v31;
+      if ( !BYTE4(from_to_add[0]) )
+        BYTE4(from_to_add[0]) = 1;
+      LODWORD(from_to_add[0]) = v31;
+      v40 = 0;
+      if ( v60 == v61 )
+      {
+        v33 = 0;
+      }
+      else
+      {
+        sub_1850F63F0(a1, (char *)v64, v31, &v60);
+        v33 = v64[0];
+        v40 = v64[0];
+      }
+      sub_1850FFD60((_QWORD *)(a1 + 248), v32);
+      v34 = v62;
+      v35 = v63;
+      while ( v34 != v35 )
+      {
+        sub_1850FFB50(a1 + 248, v32, v34);
+        v34 += 64LL;
+      }
+      v41 = 0;
+      v36 = *(_QWORD *)(a2 + 8);
+      if ( v36 >= *(_QWORD *)(a2 + 16) )
+      {
+        v37 = sub_1850FC8F0(a2, &v41, from_to_add, &v45, &v40);
+      }
+      else
+      {
+        if ( !v36 )
+          goto LABEL_100;
+        sub_1850D20A0(v64, from_to_add);
+        LOBYTE(v39) = v33;
+        sub_1850D5F70(v36, 0LL, v64, (unsigned int)v16, v39);
+        v37 = v36 + 1992;
+      }
+      *(_QWORD *)(a2 + 8) = v37;
+      sub_1850D2650(&v54);
+    }
+    else if ( error )
+    {
+      if ( DWORD2(v47) == 19 )
+        *error = 2;
+      else
+        *error = 4;
+    }
+    if ( v46[6] < 0 )
+      sub_1826B0720();
+    if ( v46[3] < 0 )
+      sub_1826B0720();
+    goto LABEL_52;
+  }
+  if ( error )
+    *error = 3;
+  *(_OWORD *)a2 = 0LL;
+  *(_QWORD *)(a2 + 16) = 0LL;
+LABEL_33:
+  if ( v53 < 0 )
+    sub_1826B0720();
+  sub_1850D2650(from_to_add);
+LABEL_19:
+  if ( *(_QWORD *)(a1 + 40) )
+  {
+    sub_1850F99F0(a1, v64);
+    sub_1850FB9D0(a1 + 40, (unsigned __int16)v64[0]);
+  }
+  from_to_add[0] = 108LL;
+  if ( byte_18E15D56C )
+  {
+    *(_QWORD *)v64 = 0LL;
+    sub_1819B1270((unsigned __int8)byte_18E15D56C, from_to_add, (__int64)v64, 2);
+  }
+  if ( ((unsigned __int64)v38 ^ v65) != _security_cookie )
+  {
+    sub_1826B4860((unsigned __int64)v38 ^ v65);
+    __debugbreak();
+  }
+  return a2;
+}
+```
+
+EncryptedString을 따라가보면
+
+```python
+EncryptionResult LoginDatabase::EncryptedString(
+    const std::u16string& plain_text,
+    std::string* cipher_text) const {
+  bool result = encryptor_
+                    ? encryptor_->EncryptString16(plain_text, cipher_text)
+                    : OSCrypt::EncryptString16(plain_text, cipher_text);
+  return result ? EncryptionResult::kSuccess
+                : EncryptionResult::kServiceFailure;
+}
+```
+
+으로 실제 코드인
+
+```python
+EncryptionResult LoginDatabase::EncryptedString(
+    const std::u16string& plain_text,
+    std::string* cipher_text) const {
+  bool result = encryptor_
+                    ? encryptor_->EncryptString16(plain_text, cipher_text)
+                    : OSCrypt::EncryptString16(plain_text, cipher_text);
+  return result ? EncryptionResult::kSuccess
+                : EncryptionResult::kServiceFailure;
+}
+```
+
+와 매우 유사하다. 
+
+encryptor_에 따라 사용하는 함수가 달라진다.
+
+실제로 크롬으로 해봤을 때는 OSCrypt::로 넘어갔다. (직접 복호화 코드 실행 시 잘 돌아갔기 때문)
+
+ whale로는 x64dbg를 통해서 bp를 걸고 따라가보니 
+
+![image.png](/assets/images/image%2021.png)
+
+마찬가지로 OSCrypt로 넘어간다
+
+![image.png](/assets/images/image%2022.png)
+
+인자를 보면 내가 입력한 비밀번호가 rdx나 r12에 utf-16으로 들어가있는걸 확인할 수 잇다.
+
+![image.png](/assets/images/image%2023.png)
+
+OSCrypt에서는 rcx가 plaintext고 rdx가 cipher이다.
+
+![image.png](/assets/images/image%2024.png)
+
+여기서 cipher에 값이 추가됐다.
+
+![image.png](/assets/images/image%2025.png)
+
+![image.png](/assets/images/image%2026.png)
+
+일치한다.
+
+내부에서 작은함수(enc1) 끝났을 때
+
+![image.png](/assets/images/image%2027.png)
+
+??? v10?? 크롬식인듯?
+
+최종 encrypt 함수이다.
+
+```python
+void __fastcall encrypt(__int64 plain, __int64 cipher, __int64 a3)
+{
+  __int64 v5; // rax
+  __int64 v6; // rcx
+  _BYTE v7[32]; // [rsp+0h] [rbp-C8h] BYREF
+  __int128 v8; // [rsp+20h] [rbp-A8h] BYREF
+  __int64 v9; // [rsp+30h] [rbp-98h]
+  __int128 v10; // [rsp+40h] [rbp-88h] BYREF
+  __int64 v11; // [rsp+50h] [rbp-78h]
+  __int128 v12; // [rsp+60h] [rbp-68h] BYREF
+  __int64 v13; // [rsp+70h] [rbp-58h]
+  __int64 v14[2]; // [rsp+78h] [rbp-50h] BYREF
+  char v15; // [rsp+8Fh] [rbp-39h]
+  __int128 v16[2]; // [rsp+90h] [rbp-38h] BYREF
+  __int64 v17; // [rsp+B0h] [rbp-18h]
+
+  if ( (unsigned __int8)chrome(plain, cipher) )
+  {
+    memset(v16, 170, 24);
+    if ( *(char *)(cipher + 23) < 0 )
+    {
+      sub_181F45EE0((__int64)v16, *(_QWORD *)cipher, *(_QWORD *)(cipher + 8));
+    }
+    else
+    {
+      *(_QWORD *)&v16[1] = *(_QWORD *)(cipher + 16);
+      v16[0] = *(_OWORD *)cipher;
+    }
+    v13 = 0x300000000000000LL;
+    v12 = 0LL;
+    v11 = 0LL;
+    v10 = 0LL;
+    sub_186B701A0((__int64)v14);
+    LODWORD(v12) = 3223927;
+    v5 = *(char *)(a3 + 23);
+    v6 = v5;
+    if ( v5 < 0 )
+      v6 = *(_QWORD *)(a3 + 8);
+    if ( v6 )
+    {
+      if ( (v5 & 0x80u) == 0LL )
+      {
+        v9 = *(_QWORD *)(a3 + 16);
+        v8 = *(_OWORD *)a3;
+      }
+      else
+      {
+        sub_181F45EE0((__int64)&v8, *(_QWORD *)a3, *(_QWORD *)(a3 + 8));
+      }
+    }
+    else
+    {
+      sub_186B708E0(&v8);
+    }
+    sub_181E7D3B0((__int64)&v10, &v8);
+    if ( v9 < 0 )
+      sub_1826B0720();
+    if ( (unsigned __int8)enc2(v16, cipher, v14, &v10, v8, *((_QWORD *)&v8 + 1), v9) )
+      enc3(cipher, 0LL, &v12, 3LL);
+    if ( v11 < 0 )
+      sub_1826B0720();
+    if ( v13 < 0 )
+      sub_1826B0720();
+    if ( v15 < 0 )
+      sub_1826B0720();
+    if ( SBYTE7(v16[1]) < 0 )
+      sub_1826B0720();
+  }
+  if ( ((unsigned __int64)v7 ^ v17) != _security_cookie )
+  {
+    sub_1826B4860((unsigned __int64)v7 ^ v17);
+    __debugbreak();
+  }
+}
+```
+
+enc1에서는 chrome이랑 똑같은 encrypt진행하고
+
+enc2에서 cipher이 가리키는 주소가 바뀌고 (알고보니 aes로 암호화해서 그 주소를 cipher에 넣음)
+
+enc3에서 cipher이 가리키는 주소에 있는 값이 바뀐다. (알고보니 string insert())
+
+enc2의 세부 함수
+
+```python
+__int64 __fastcall sub_1863308A0(__int64 a1, unsigned int a2, __int64 a3, __int64 cipher)
+{
+  unsigned int v6; // ebx
+  __int64 v8; // rax
+  __int64 v9; // rdx
+  bool v10; // cf
+  __int64 v11; // rdx
+  _BYTE *v12; // r15
+  __int64 v13; // rax
+  _QWORD v15[6]; // [rsp+0h] [rbp-D8h] BYREF
+  __int128 v16; // [rsp+30h] [rbp-A8h]
+  __int64 v17[2]; // [rsp+40h] [rbp-98h] BYREF
+  __int128 v18; // [rsp+50h] [rbp-88h]
+  _BYTE *v19; // [rsp+60h] [rbp-78h]
+  __int64 v20; // [rsp+68h] [rbp-70h]
+  __int128 v21; // [rsp+70h] [rbp-68h] BYREF
+  _BYTE v22[24]; // [rsp+80h] [rbp-58h] BYREF
+  __int64 v23; // [rsp+98h] [rbp-40h]
+
+  v6 = a2;
+  memset(v22, 170, sizeof(v22));
+  v8 = *(_QWORD *)(a3 + 8);
+  if ( (_BYTE)a2 )
+    v9 = 16 * (unsigned int)(*(_DWORD *)(a1 + 8) == 0);
+  else
+    v9 = 0LL;
+  v10 = __CFADD__(v8, v9);
+  v11 = v8 + v9;
+  if ( v10 )
+  {
+    __debugbreak();
+    BUG();
+  }
+  v12 = v22;
+  sub_182053520(v22, v11, 0LL);
+  v21 = xmmword_18C609AE0;
+  v13 = v22[23];
+  if ( v22[23] < 0LL )
+  {
+    v13 = *(_QWORD *)&v22[8];
+    v12 = *(_BYTE **)v22;
+  }
+  if ( *(_DWORD *)(a1 + 8) == 1 )
+  {
+    v19 = v12;
+    v20 = v13;
+    v18 = *(_OWORD *)a3;
+    sub_186330B50(a1, &v21);
+  }
+  else
+  {
+    v17[0] = (__int64)v12;
+    v17[1] = v13;
+    v16 = *(_OWORD *)a3;
+    v15[4] = v17;
+    sub_186330CA0(a1, &v21, v6);
+  }
+  LOBYTE(v6) = BYTE8(v21);
+  if ( BYTE8(v21) == 1 )
+  {
+    sub_181DBEC80(v22, v21, 0LL);
+    if ( *(char *)(cipher + 23) < 0 )
+      sub_1826B0720();
+    *(_QWORD *)(cipher + 16) = *(_QWORD *)&v22[16];
+    *(_OWORD *)cipher = *(_OWORD *)v22;
+  }
+  else if ( v22[23] < 0 )
+  {
+    sub_1826B0720();
+  }
+  if ( ((unsigned __int64)v15 ^ v23) != _security_cookie )
+  {
+    sub_1826B4860((unsigned __int64)v15 ^ v23);
+    __debugbreak();
+  }
+  return v6;
+}
+```
+
+함수 들어가보면 문자열로 나오는데 PBKDF2를 통해 key를 얻는다.
+
+chrome 암호화부분도 봤는데 들어가니까
+
+```python
+__int64 __fastcall sub_186B724B0(__int64 a1, __int64 **a2, unsigned __int64 a3)
+{
+  __int64 **v4; // rdi
+  _BYTE *v7; // r14
+  __int64 v8; // rax
+  __int64 v9; // rax
+  unsigned int v10; // ebx
+  _BYTE *v11; // r8
+  __int64 v12; // r9
+  _BYTE v13[32]; // [rsp+0h] [rbp-128h] BYREF
+  _QWORD v14[2]; // [rsp+30h] [rbp-F8h] BYREF
+  __int64 v15[2]; // [rsp+40h] [rbp-E8h] BYREF
+  __int128 v16; // [rsp+50h] [rbp-D8h] BYREF
+  __int64 v17; // [rsp+60h] [rbp-C8h]
+  __int64 v18[4]; // [rsp+68h] [rbp-C0h] BYREF
+  _BYTE v19[24]; // [rsp+88h] [rbp-A0h] BYREF
+  __int64 v20[4]; // [rsp+A0h] [rbp-88h] BYREF
+  char v21[40]; // [rsp+C0h] [rbp-68h] BYREF
+  __int64 v22; // [rsp+E8h] [rbp-40h]
+
+  v4 = a2;
+  if ( *(_BYTE *)(a1 + 1) == 1 )
+    return sub_186B730C0(a2, a3);
+  memset(v21, 170, 32);
+  sub_186331610(v21, 1LL);
+  memset(v20, 170, 24);
+  sub_186B72E40(a1, v20);
+  sub_1863317E0(v21, v20);
+  v7 = v19;
+  *(_OWORD *)&v19[8] = xmmword_18C609AE0;
+  v19[23] = 12;
+  *(_QWORD *)v19 = 0LL;
+  *(_QWORD *)&v19[5] = 0LL;
+  v18[2] = (__int64)v19;
+  v18[3] = 12LL;
+  sub_1829425B0();
+  v17 = 0LL;
+  v16 = 0LL;
+  v18[0] = (__int64)&v16;
+  v18[1] = 0LL;
+  v8 = v19[23];
+  if ( v19[23] < 0LL )
+  {
+    v8 = *(_QWORD *)&v19[8];
+    v7 = *(_BYTE **)v19;
+  }
+  v15[0] = (__int64)v7;
+  v15[1] = v8;
+  v9 = *((char *)v4 + 23);
+  if ( v9 < 0 )
+  {
+    v9 = (__int64)v4[1];
+    v4 = (__int64 **)*v4;
+  }
+  v14[0] = v4;
+  v14[1] = v9;
+  v10 = sub_186331AD0((unsigned int)v21, (unsigned int)v14, (unsigned int)v15, (unsigned int)v18, a3);
+  if ( v17 < 0 )
+    sub_1826B0720();
+  if ( (_BYTE)v10 )
+  {
+    v11 = v19;
+    v12 = v19[23];
+    if ( v19[23] < 0LL )
+    {
+      v12 = *(_QWORD *)&v19[8];
+      v11 = *(_BYTE **)v19;
+    }
+    enc3(a3, 0LL, (unsigned __int64)v11, v12);
+    enc3(a3, 0LL, (unsigned __int64)"v10", 3LL);
+  }
+  if ( v19[23] < 0 )
+    sub_1826B0720();
+  if ( v20[2] < 0 )
+    sub_1826B0720();
+  sub_1863316D0(v21);
+  if ( ((unsigned __int64)v13 ^ v22) != _security_cookie )
+  {
+    sub_1826B4860((unsigned __int64)v13 ^ v22);
+    __debugbreak();
+  }
+  return v10;
+}
+```
+
+여기서 아까 설정했던 enc3가 나온다.
+
+enc3(a3, 0LL, (unsigned __int64)v11, v12);
+    enc3(a3, 0LL, (unsigned __int64)"v10", 3LL);
+
+이거 완전
+
+ciphertext->insert(0, nonce);
+ciphertext->insert(0, kEncryptionVersionPrefix);
+
+다.
+
+즉 a3→insert(0,”v10”,3)이다.
+
+enc3은 string insert함수
+
+난수생성 부분도 찾았다. (이건 쓸모X)
+
+```python
+__int64 __fastcall sub_182066F40(_QWORD *a1)
+{
+  __int64 v1; // rdi
+  __int64 v2; // rsi
+  __int64 result; // rax
+  HMODULE LibraryW; // rax
+  FARPROC ProcAddress; // rax
+
+  v1 = *a1;
+  v2 = a1[1];
+  if ( (byte_18E15D984 & 1) != 0 )
+    return sub_180C499A0(*a1, v2);
+  if ( dword_18E15D990 > *(_DWORD *)(*((_QWORD *)NtCurrentTeb()->ThreadLocalStoragePointer + (unsigned int)TlsIndex)
+                                   + 4LL) )
+  {
+    sub_1826B0BC4(&dword_18E15D990);
+    if ( dword_18E15D990 == -1 )
+    {
+      LibraryW = LoadLibraryW(word_18D4C866A);
+      if ( !LibraryW )
+      {
+        __debugbreak();
+        BUG();
+      }
+      ProcAddress = GetProcAddress(LibraryW, "ProcessPrng");
+      if ( !ProcAddress )
+      {
+        __debugbreak();
+        BUG();
+      }
+      qword_18E15D988 = (__int64)ProcAddress;
+      sub_1826B0B58(&dword_18E15D990);
+    }
+  }
+  result = ((__int64 (__fastcall *)(__int64, __int64))qword_18E15D988)(v1, v2);
+  if ( !(_DWORD)result )
+  {
+    __debugbreak();
+    BUG();
+  }
+  return result;
+}
+```
+
+![image.png](/assets/images/image%2028.png)
+
+![image.png](/assets/images/image%2029.png)
+
+enc2 내부에
+
+```python
+char __fastcall sub_186330730(__int64 a1, __int64 a2, int a3, __int64 *a4)
+{
+  __int64 v8; // rax
+  __int128 *v9; // rax
+  char result; // al
+  __int64 v11; // r9
+  __int64 v12; // rcx
+  _QWORD v13[8]; // [rsp+0h] [rbp-88h] BYREF
+  __int64 v14; // [rsp+40h] [rbp-48h]
+  __int64 v15; // [rsp+48h] [rbp-40h]
+  __int64 v16; // [rsp+50h] [rbp-38h]
+  __int64 v17; // [rsp+58h] [rbp-30h]
+
+  if ( a3 == 1 )
+  {
+    if ( a4[1] )
+      goto LABEL_11;
+  }
+  else if ( !a3 && a4[1] != 16 )
+  {
+    goto LABEL_11;
+  }
+  v8 = *(char *)(a2 + 31);
+  if ( v8 < 0 )
+    v8 = *(_QWORD *)(a2 + 16);
+  if ( v8 == 32 )
+  {
+    v9 = sub_1865A1A00();
+  }
+  else
+  {
+    if ( v8 != 16 )
+    {
+LABEL_11:
+      result = 0;
+      goto LABEL_12;
+    }
+    v9 = (__int128 *)sub_1865A1770();
+  }
+  if ( !v9 )
+    goto LABEL_11;
+  if ( (a2 & 0xFFFFFFFC00000000uLL) == qword_18E073C48 )
+    sub_180001C00(a2);
+  if ( (*(_QWORD *)a1 & 0xFFFFFFFC00000000uLL) == qword_18E073C48 )
+    sub_1800020A0(*(_QWORD *)a1);
+  *(_QWORD *)a1 = a2;
+  *(_DWORD *)(a1 + 8) = a3;
+  v11 = a4[1];
+  if ( v11 < 0 )
+  {
+    __debugbreak();
+    BUG();
+  }
+  v12 = *a4 + v11;
+  v14 = *a4;
+  v15 = v12;
+  v16 = v12;
+  v13[5] = v14;
+  v13[6] = v14;
+  v13[7] = v12;
+  sub_183753010(a1 + 16);
+  result = 1;
+LABEL_12:
+  if ( ((unsigned __int64)v13 ^ v17) != _security_cookie )
+  {
+    sub_1826B4860((unsigned __int64)v13 ^ v17);
+    __debugbreak();
+  }
+  return result;
+}
+```
+
+이 함수를 보면 aes-256할지 aes-128할지 선택하는 코드로 보인다.
+
+password
+
+![image.png](/assets/images/image%2030.png)
+
+salt
+
+![image.png](/assets/images/image%2031.png)
+
+key_obj
+
+![image.png](/assets/images/image%2032.png)
+
+key::
+
+![image.png](/assets/images/image%2033.png)
+
+if ( !(unsigned int)cipher_c_inc(v24[0].m128i_i64, v11, 0LL, (__int64)v13,
+(const __m128i *)key_obj[2], mode) )
+
+이게
+
+EVP_CipherInit_ex(ctx.get(), cipher, nullptr,
+reinterpret_cast<const uint8_t*>(key.data()),
+iv_.data(), do_encrypt)
+
+일 것이다.
+
+따라서 IV는 key_obj[2]
+
+![image.png](/assets/images/image%2034.png)
+
+# 즉 기존 AES_128_CBC(chrome(plaintext)) 이며 IV=0x20202020202020202020202020202020
+
+이제 key가 뭘 기준으로 만들어지는지만 알아내면 끝이다.
+
+key만들 때 salt=
+
+bd289b0af38f703b
+514a7fa7468eccbf
+
+고정이다. (pc마다 고정값. Local State에서 읽어와서 암호화?하면 됨.)
+
+```c
+__int64 __fastcall sub_7FFB15F97800(unsigned int *a1, _DWORD *a2, __int64 a3)
+{
+  _DWORD *v3; // rsi
+  _DWORD *v5; // rdi
+  __int64 result; // rax
+  unsigned int v7; // ebx
+  unsigned int v8; // ecx
+  unsigned int v9; // edx
+  int v10; // r8d
+  unsigned int v11; // r9d
+  unsigned int v12; // r14d
+  unsigned int v13; // r15d
+  unsigned int v14; // eax
+  unsigned int v15; // edx
+  unsigned int v16; // ecx
+  unsigned int v17; // ebx
+  unsigned int v18; // eax
+  unsigned int v19; // edx
+  unsigned int v20; // ecx
+  unsigned int v21; // ebx
+  int v22; // eax
+  int v23; // edx
+  int v24; // ecx
+  int v25; // ebx
+  int v26; // eax
+  int v27; // edx
+  int v28; // ecx
+  int v29; // ebx
+  int v30; // eax
+  int v31; // edx
+  int v32; // ecx
+  int v33; // ebx
+  int v34; // eax
+  int v35; // edx
+  int v36; // ecx
+  int v37; // ebx
+  int v38; // eax
+  int v39; // edx
+  int v40; // ecx
+  int v41; // ebx
+  int v42; // eax
+  int v43; // edx
+  int v44; // ecx
+  int v45; // ebx
+  int v46; // eax
+  int v47; // edx
+  int v48; // ecx
+  int v49; // ebx
+  int v50; // eax
+  int v51; // edx
+  int v52; // ecx
+  int v53; // ebx
+  int v54; // eax
+  int v55; // edx
+  int v56; // ecx
+  int v57; // ebx
+  int v58; // eax
+  int v59; // edx
+  int v60; // ecx
+  int v61; // ebx
+  int v62; // eax
+  int v63; // edx
+  int v64; // ecx
+  int v65; // ebx
+  int v66; // eax
+  int v67; // edx
+  int v68; // ecx
+  int v69; // ebx
+  int v70; // eax
+  int v71; // edx
+  int v72; // ecx
+  int v73; // ebx
+  int v74; // eax
+  int v75; // edx
+  int v76; // ecx
+  int v77; // ebx
+
+  v3 = a2;
+  v5 = &a2[16 * a3];
+  result = *a1;
+  v7 = a1[1];
+  v8 = a1[2];
+  v9 = a1[3];
+  if ( v3 != v5 )
+  {
+    do
+    {
+      v10 = result;
+      v11 = v7;
+      v12 = v8;
+      v13 = v9;
+      v14 = v7 + __ROL4__((v9 ^ v7 & (v8 ^ v9)) + result + *v3 - 680876936, 7);
+      v15 = v14 + __ROL4__((v8 ^ v14 & (v7 ^ v8)) + v9 + v3[1] - 389564586, 12);
+      v16 = v15 + __ROL4__((v7 ^ v15 & (v14 ^ v7)) + v8 + v3[2] + 606105819, 17);
+      v17 = v16 + __ROL4__((v14 ^ v16 & (v15 ^ v14)) + v7 + v3[3] - 1044525330, 22);
+      v18 = v17 + __ROL4__((v15 ^ v17 & (v16 ^ v15)) + v14 + v3[4] - 176418897, 7);
+      v19 = v18 + __ROL4__((v16 ^ v18 & (v17 ^ v16)) + v15 + v3[5] + 1200080426, 12);
+      v20 = v19 + __ROL4__((v17 ^ v19 & (v18 ^ v17)) + v16 + v3[6] - 1473231341, 17);
+      v21 = v20 + __ROL4__((v18 ^ v20 & (v19 ^ v18)) + v17 + v3[7] - 45705983, 22);
+      v22 = v21 + __ROL4__((v19 ^ v21 & (v20 ^ v19)) + v18 + v3[8] + 1770035416, 7);
+      v23 = v22 + __ROL4__((v20 ^ v22 & (v21 ^ v20)) + v19 + v3[9] - 1958414417, 12);
+      v24 = v23 + __ROL4__((v21 ^ v23 & (v22 ^ v21)) + v20 + v3[10] - 42063, 17);
+      v25 = v24 + __ROL4__((v22 ^ v24 & (v23 ^ v22)) + v21 + v3[11] - 1990404162, 22);
+      v26 = v25 + __ROL4__((v23 ^ v25 & (v24 ^ v23)) + v22 + v3[12] + 1804603682, 7);
+      v27 = v26 + __ROL4__((v24 ^ v26 & (v25 ^ v24)) + v23 + v3[13] - 40341101, 12);
+      v28 = v27 + __ROL4__((v25 ^ v27 & (v26 ^ v25)) + v24 + v3[14] - 1502002290, 17);
+      v29 = v28 + __ROL4__((v26 ^ v28 & (v27 ^ v26)) + v25 + v3[15] + 1236535329, 22);
+      v30 = v29 + __ROL4__((v28 & ~v27 | v29 & v27) + v26 + v3[1] - 165796510, 5);
+      v31 = v30 + __ROL4__((v29 & ~v28 | v30 & v28) + v27 + v3[6] - 1069501632, 9);
+      v32 = v31 + __ROL4__((v30 & ~v29 | v31 & v29) + v28 + v3[11] + 643717713, 14);
+      v33 = v32 + __ROL4__((v31 & ~v30 | v32 & v30) + v29 + *v3 - 373897302, 20);
+      v34 = v33 + __ROL4__((v32 & ~v31 | v33 & v31) + v30 + v3[5] - 701558691, 5);
+      v35 = v34 + __ROL4__((v33 & ~v32 | v34 & v32) + v31 + v3[10] + 38016083, 9);
+      v36 = v35 + __ROL4__((v34 & ~v33 | v35 & v33) + v32 + v3[15] - 660478335, 14);
+      v37 = v36 + __ROL4__((v35 & ~v34 | v36 & v34) + v33 + v3[4] - 405537848, 20);
+      v38 = v37 + __ROL4__((v36 & ~v35 | v37 & v35) + v34 + v3[9] + 568446438, 5);
+      v39 = v38 + __ROL4__((v37 & ~v36 | v38 & v36) + v35 + v3[14] - 1019803690, 9);
+      v40 = v39 + __ROL4__((v38 & ~v37 | v39 & v37) + v36 + v3[3] - 187363961, 14);
+      v41 = v40 + __ROL4__((v39 & ~v38 | v40 & v38) + v37 + v3[8] + 1163531501, 20);
+      v42 = v41 + __ROL4__((v40 & ~v39 | v41 & v39) + v38 + v3[13] - 1444681467, 5);
+      v43 = v42 + __ROL4__((v41 & ~v40 | v42 & v40) + v39 + v3[2] - 51403784, 9);
+      v44 = v43 + __ROL4__((v42 & ~v41 | v43 & v41) + v40 + v3[7] + 1735328473, 14);
+      v45 = v44 + __ROL4__((v43 & ~v42 | v44 & v42) + v41 + v3[12] - 1926607734, 20);
+      v46 = v45 + __ROL4__((v45 ^ v43 ^ v44) + v42 + v3[5] - 378558, 4);
+      v47 = v46 + __ROL4__((v46 ^ v44 ^ v45) + v43 + v3[8] - 2022574463, 11);
+      v48 = v47 + __ROL4__((v47 ^ v45 ^ v46) + v44 + v3[11] + 1839030562, 16);
+      v49 = v48 + __ROL4__((v48 ^ v46 ^ v47) + v45 + v3[14] - 35309556, 23);
+      v50 = v49 + __ROL4__((v49 ^ v47 ^ v48) + v46 + v3[1] - 1530992060, 4);
+      v51 = v50 + __ROL4__((v50 ^ v48 ^ v49) + v47 + v3[4] + 1272893353, 11);
+      v52 = v51 + __ROL4__((v51 ^ v49 ^ v50) + v48 + v3[7] - 155497632, 16);
+      v53 = v52 + __ROL4__((v52 ^ v50 ^ v51) + v49 + v3[10] - 1094730640, 23);
+      v54 = v53 + __ROL4__((v53 ^ v51 ^ v52) + v50 + v3[13] + 681279174, 4);
+      v55 = v54 + __ROL4__((v54 ^ v52 ^ v53) + v51 + *v3 - 358537222, 11);
+      v56 = v55 + __ROL4__((v55 ^ v53 ^ v54) + v52 + v3[3] - 722521979, 16);
+      v57 = v56 + __ROL4__((v56 ^ v54 ^ v55) + v53 + v3[6] + 76029189, 23);
+      v58 = v57 + __ROL4__((v57 ^ v55 ^ v56) + v54 + v3[9] - 640364487, 4);
+      v59 = v58 + __ROL4__((v58 ^ v56 ^ v57) + v55 + v3[12] - 421815835, 11);
+      v60 = v59 + __ROL4__((v59 ^ v57 ^ v58) + v56 + v3[15] + 530742520, 16);
+      v61 = v60 + __ROL4__((v60 ^ v58 ^ v59) + v57 + v3[2] - 995338651, 23);
+      v62 = v61 + __ROL4__((v60 ^ (v61 | ~v59)) + v58 + *v3 - 198630844, 6);
+      v63 = v62 + __ROL4__((v61 ^ (v62 | ~v60)) + v59 + v3[7] + 1126891415, 10);
+      v64 = v63 + __ROL4__((v62 ^ (v63 | ~v61)) + v60 + v3[14] - 1416354905, 15);
+      v65 = v64 + __ROL4__((v63 ^ (v64 | ~v62)) + v61 + v3[5] - 57434055, 21);
+      v66 = v65 + __ROL4__((v64 ^ (v65 | ~v63)) + v62 + v3[12] + 1700485571, 6);
+      v67 = v66 + __ROL4__((v65 ^ (v66 | ~v64)) + v63 + v3[3] - 1894986606, 10);
+      v68 = v67 + __ROL4__((v66 ^ (v67 | ~v65)) + v64 + v3[10] - 1051523, 15);
+      v69 = v68 + __ROL4__((v67 ^ (v68 | ~v66)) + v65 + v3[1] - 2054922799, 21);
+      v70 = v69 + __ROL4__((v68 ^ (v69 | ~v67)) + v66 + v3[8] + 1873313359, 6);
+      v71 = v70 + __ROL4__((v69 ^ (v70 | ~v68)) + v67 + v3[15] - 30611744, 10);
+      v72 = v71 + __ROL4__((v70 ^ (v71 | ~v69)) + v68 + v3[6] - 1560198380, 15);
+      v73 = v72 + __ROL4__((v71 ^ (v72 | ~v70)) + v69 + v3[13] + 1309151649, 21);
+      v74 = v73 + __ROL4__((v72 ^ (v73 | ~v71)) + v70 + v3[4] - 145523070, 6);
+      v75 = v74 + __ROL4__((v73 ^ (v74 | ~v72)) + v71 + v3[11] - 1120210379, 10);
+      v76 = v75 + __ROL4__((v74 ^ (v75 | ~v73)) + v72 + v3[2] + 718787259, 15);
+      v77 = __ROL4__((v75 ^ (v76 | ~v74)) + v73 + v3[9] - 343485551, 21);
+      result = (unsigned int)(v10 + v74);
+      v7 = v11 + v76 + v77;
+      v8 = v12 + v76;
+      v9 = v13 + v75;
+      v3 += 16;
+    }
+    while ( v3 < v5 );
+  }
+  *a1 = result;
+  a1[1] = v7;
+  a1[2] = v8;
+  a1[3] = v9;
+  return result;
+}
+```
+
+salt는 이렇게 만들어진다.
+
+만들어질때사용되는 파일은 Local State이다.
+
+Local State에서 "user_log":{"clientid":"a26e5eac-ad72-486e-be96-4a7520ed4521","init_ts":"1715602368216","init_ts2":"1728821948433"} 을 볼 수 있는데, 이 중 clientid +”s”+init_ts2가 사용된다.
+
+md5 느낌나는데 자신없어서 그냥 그대로 파이썬으로 포팅해줬다.
+
+이걸로 salt fix
+
+password=B1 48 76 0C F8 E9 D3 46 33 20 87 0C 1D 23 27 13 고정이다. (다른 컴퓨터도 해봄.)
+
+그럼 key가 구해진다.
+
+즉 key=PBKDF2(password,salt)
+
+IV=”20202020202020202020202020202020”
+
+plaintext=chrome(plaintext)=
+
+7631302D8537AD2509C09B9872FAF364
+A70EF9BDF90F92C62F8DD8D1DAD75A32
+38CC435D6B8449
+
+이런식으로 나온다.
+
+= =으로 감싼 부분은 
+
+===============================================================
+
+이걸 디버깅 하려고해도 오픈소스상 aead::Seal 같은 함수밖에 없는데 따라가도 막상 bp를 걸만한 windows API도 없어서 힘들다.
+
+그래서 생각한 방법이 두개가 있다.
+
+첫번째는 ida의 bindiff 플러그인을 통한 chrome.dll과 whale.dll의 diffing
+
+두번째는 chrome을 직접 빌드해서 심볼(pdb)를 얻은 다음 그걸 바탕으로 암호화부분을 찾고 그 암호화 부분과 비슷한 어셈블리를 검색하여 whale에서 해당 부분을 찾아서 바뀐 암호화 알고리즘을 찾는 것이다.
+
+![image.png](/assets/images/image%2035.png)
+
+두개 동시에 하는중…
+
+diffing이 안끝나서 chrome을 빌드하였다. (원본처럼 최적화를 킨상태로함.)
+
+![image.png](/assets/images/image%2036.png)
+
+자꾸 오류나서 실패함. bindiff는 오래걸려도 되긴 됐는데 유용한 정보를 얻지 못함.
+
+=================================================================
+
+# whale 결론
+
+chrome에서 사용하는 암호화를 chrome()이라고 하면
+
+암호화는 aes128cbc(chrome)이다.
+
+테스트 결과
+
+![image.png](/assets/images/image%2037.png)
+
+![image.png](/assets/images/image%2038.png)
+
+로컬에서 성공
+
+![image.png](/assets/images/image%2039.png)
+
+다른컴퓨터, 다른 계정으로 했지만 성공!
+
+# whale 암/복호화 코드 + salt구하고 key생성
+
+## ex.py
+
+```python
+import struct
+import hashlib
+import binascii
+import os
+import json
+import base64
+import sys
+import win32crypt
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad, unpad
+def _ROL4(x, n):
+    x &= 0xFFFFFFFF
+    n &= 31
+    return ((x << n) & 0xFFFFFFFF) | (x >> (32 - n))
+
+def sub_7FFB15F97800(a1, a2, a3): #복붙
+
+    result = a1[0] & 0xFFFFFFFF
+    v7 = a1[1] & 0xFFFFFFFF
+    v8 = a1[2] & 0xFFFFFFFF
+    v9 = a1[3] & 0xFFFFFFFF
+
+    idx = 0
+    end_idx = 16 * a3
+
+    while idx < end_idx:
+        block = a2[idx : idx + 16]
+        v10  = result
+        v11  = v7
+        v12  = v8
+        v13_ = v9
+        # 디컴파일된 64스텝 연산 (MD5-like). 모든 단계 & 0xFFFFFFFF해줌
+        v14 = (v7 + _ROL4(((v9 ^ (v7 & (v8 ^ v9))) + result + block[0] - 680876936) & 0xFFFFFFFF, 7)) & 0xFFFFFFFF
+        v15 = (v14 + _ROL4(((v8 ^ (v14 & (v7 ^ v8))) + v9 + block[1] - 389564586) & 0xFFFFFFFF, 12)) & 0xFFFFFFFF
+        v16 = (v15 + _ROL4(((v7 ^ (v15 & (v14 ^ v7))) + v8 + block[2] + 606105819) & 0xFFFFFFFF, 17)) & 0xFFFFFFFF
+        v17 = (v16 + _ROL4(((v14 ^ (v16 & (v15 ^ v14))) + v7 + block[3] - 1044525330) & 0xFFFFFFFF, 22)) & 0xFFFFFFFF
+        v18 = (v17 + _ROL4(((v15 ^ (v17 & (v16 ^ v15))) + v14 + block[4] - 176418897) & 0xFFFFFFFF, 7)) & 0xFFFFFFFF
+        v19 = (v18 + _ROL4(((v16 ^ (v18 & (v17 ^ v16))) + v15 + block[5] + 1200080426) & 0xFFFFFFFF, 12)) & 0xFFFFFFFF
+        v20 = (v19 + _ROL4(((v17 ^ (v19 & (v18 ^ v17))) + v16 + block[6] - 1473231341) & 0xFFFFFFFF, 17)) & 0xFFFFFFFF
+        v21 = (v20 + _ROL4(((v18 ^ (v20 & (v19 ^ v18))) + v17 + block[7] - 45705983) & 0xFFFFFFFF, 22)) & 0xFFFFFFFF
+        v22 = (v21 + _ROL4(((v19 ^ (v21 & (v20 ^ v19))) + v18 + block[8] + 1770035416) & 0xFFFFFFFF, 7)) & 0xFFFFFFFF
+        v23 = (v22 + _ROL4(((v20 ^ (v22 & (v21 ^ v20))) + v19 + block[9] - 1958414417) & 0xFFFFFFFF, 12)) & 0xFFFFFFFF
+        v24 = (v23 + _ROL4(((v21 ^ (v23 & (v22 ^ v21))) + v20 + block[10] - 42063) & 0xFFFFFFFF, 17)) & 0xFFFFFFFF
+        v25 = (v24 + _ROL4(((v22 ^ (v24 & (v23 ^ v22))) + v21 + block[11] - 1990404162) & 0xFFFFFFFF, 22)) & 0xFFFFFFFF
+        v26 = (v25 + _ROL4(((v23 ^ (v25 & (v24 ^ v23))) + v22 + block[12] + 1804603682) & 0xFFFFFFFF, 7)) & 0xFFFFFFFF
+        v27 = (v26 + _ROL4(((v24 ^ (v26 & (v25 ^ v24))) + v23 + block[13] - 40341101) & 0xFFFFFFFF, 12)) & 0xFFFFFFFF
+        v28 = (v27 + _ROL4(((v25 ^ (v27 & (v26 ^ v25))) + v24 + block[14] - 1502002290) & 0xFFFFFFFF, 17)) & 0xFFFFFFFF
+        v29 = (v28 + _ROL4(((v26 ^ (v28 & (v27 ^ v26))) + v25 + block[15] + 1236535329) & 0xFFFFFFFF, 22)) & 0xFFFFFFFF
+        v30 = (v29 + _ROL4((((v28 & ~v27) | (v29 & v27)) & 0xFFFFFFFF) + v26 + block[1] - 165796510, 5)) & 0xFFFFFFFF
+        v31 = (v30 + _ROL4((((v29 & ~v28) | (v30 & v28)) & 0xFFFFFFFF) + v27 + block[6] - 1069501632, 9)) & 0xFFFFFFFF
+        v32 = (v31 + _ROL4((((v30 & ~v29) | (v31 & v29)) & 0xFFFFFFFF) + v28 + block[11] + 643717713, 14)) & 0xFFFFFFFF
+        v33 = (v32 + _ROL4((((v31 & ~v30) | (v32 & v30)) & 0xFFFFFFFF) + v29 + block[0] - 373897302, 20)) & 0xFFFFFFFF
+        v34 = (v33 + _ROL4((((v32 & ~v31) | (v33 & v31)) & 0xFFFFFFFF) + v30 + block[5] - 701558691, 5)) & 0xFFFFFFFF
+        v35 = (v34 + _ROL4((((v33 & ~v32) | (v34 & v32)) & 0xFFFFFFFF) + v31 + block[10] + 38016083, 9)) & 0xFFFFFFFF
+        v36 = (v35 + _ROL4((((v34 & ~v33) | (v35 & v33)) & 0xFFFFFFFF) + v32 + block[15] - 660478335, 14)) & 0xFFFFFFFF
+        v37 = (v36 + _ROL4((((v35 & ~v34) | (v36 & v34)) & 0xFFFFFFFF) + v33 + block[4] - 405537848, 20)) & 0xFFFFFFFF
+        v38 = (v37 + _ROL4((((v36 & ~v35) | (v37 & v35)) & 0xFFFFFFFF) + v34 + block[9] + 568446438, 5)) & 0xFFFFFFFF
+        v39 = (v38 + _ROL4((((v37 & ~v36) | (v38 & v36)) & 0xFFFFFFFF) + v35 + block[14] - 1019803690, 9)) & 0xFFFFFFFF
+        v40 = (v39 + _ROL4((((v38 & ~v37) | (v39 & v37)) & 0xFFFFFFFF) + v36 + block[3] - 187363961, 14)) & 0xFFFFFFFF
+        v41 = (v40 + _ROL4((((v39 & ~v38) | (v40 & v38)) & 0xFFFFFFFF) + v37 + block[8] + 1163531501, 20)) & 0xFFFFFFFF
+        v42 = (v41 + _ROL4((((v40 & ~v39) | (v41 & v39)) & 0xFFFFFFFF) + v38 + block[13] - 1444681467, 5)) & 0xFFFFFFFF
+        v43 = (v42 + _ROL4((((v41 & ~v40) | (v42 & v40)) & 0xFFFFFFFF) + v39 + block[2] - 51403784, 9)) & 0xFFFFFFFF
+        v44 = (v43 + _ROL4((((v42 & ~v41) | (v43 & v41)) & 0xFFFFFFFF) + v40 + block[7] + 1735328473, 14)) & 0xFFFFFFFF
+        v45 = (v44 + _ROL4((((v43 & ~v42) | (v44 & v42)) & 0xFFFFFFFF) + v41 + block[12] - 1926607734, 20)) & 0xFFFFFFFF
+        v46 = (v45 + _ROL4(((v45 ^ v43 ^ v44) & 0xFFFFFFFF) + v42 + block[5] - 378558, 4)) & 0xFFFFFFFF
+        v47 = (v46 + _ROL4(((v46 ^ v44 ^ v45) & 0xFFFFFFFF) + v43 + block[8] - 2022574463, 11)) & 0xFFFFFFFF
+        v48 = (v47 + _ROL4(((v47 ^ v45 ^ v46) & 0xFFFFFFFF) + v44 + block[11] + 1839030562, 16)) & 0xFFFFFFFF
+        v49 = (v48 + _ROL4(((v48 ^ v46 ^ v47) & 0xFFFFFFFF) + v45 + block[14] - 35309556, 23)) & 0xFFFFFFFF
+        v50 = (v49 + _ROL4(((v49 ^ v47 ^ v48) & 0xFFFFFFFF) + v46 + block[1] - 1530992060, 4)) & 0xFFFFFFFF
+        v51 = (v50 + _ROL4(((v50 ^ v48 ^ v49) & 0xFFFFFFFF) + v47 + block[4] + 1272893353, 11)) & 0xFFFFFFFF
+        v52 = (v51 + _ROL4(((v51 ^ v49 ^ v50) & 0xFFFFFFFF) + v48 + block[7] - 155497632, 16)) & 0xFFFFFFFF
+        v53 = (v52 + _ROL4(((v52 ^ v50 ^ v51) & 0xFFFFFFFF) + v49 + block[10] - 1094730640, 23)) & 0xFFFFFFFF
+        v54 = (v53 + _ROL4(((v53 ^ v51 ^ v52) & 0xFFFFFFFF) + v50 + block[13] + 681279174, 4)) & 0xFFFFFFFF
+        v55 = (v54 + _ROL4(((v54 ^ v52 ^ v53) & 0xFFFFFFFF) + v51 + block[0] - 358537222, 11)) & 0xFFFFFFFF
+        v56 = (v55 + _ROL4(((v55 ^ v53 ^ v54) & 0xFFFFFFFF) + v52 + block[3] - 722521979, 16)) & 0xFFFFFFFF
+        v57 = (v56 + _ROL4(((v56 ^ v54 ^ v55) & 0xFFFFFFFF) + v53 + block[6] + 76029189, 23)) & 0xFFFFFFFF
+        v58 = (v57 + _ROL4(((v57 ^ v55 ^ v56) & 0xFFFFFFFF) + v54 + block[9] - 640364487, 4)) & 0xFFFFFFFF
+        v59 = (v58 + _ROL4(((v58 ^ v56 ^ v57) & 0xFFFFFFFF) + v55 + block[12] - 421815835, 11)) & 0xFFFFFFFF
+        v60 = (v59 + _ROL4(((v59 ^ v57 ^ v58) & 0xFFFFFFFF) + v56 + block[15] + 530742520, 16)) & 0xFFFFFFFF
+        v61 = (v60 + _ROL4(((v60 ^ v58 ^ v59) & 0xFFFFFFFF) + v57 + block[2] - 995338651, 23)) & 0xFFFFFFFF
+
+        v62 = (v61 + _ROL4(((v60 ^ (v61 | ~v59)) & 0xFFFFFFFF) + v58 + block[0] - 198630844, 6)) & 0xFFFFFFFF
+        v63 = (v62 + _ROL4(((v61 ^ (v62 | ~v60)) & 0xFFFFFFFF) + v59 + block[7] + 1126891415, 10)) & 0xFFFFFFFF
+        v64 = (v63 + _ROL4(((v62 ^ (v63 | ~v61)) & 0xFFFFFFFF) + v60 + block[14] - 1416354905, 15)) & 0xFFFFFFFF
+        v65 = (v64 + _ROL4(((v63 ^ (v64 | ~v62)) & 0xFFFFFFFF) + v61 + block[5] - 57434055, 21)) & 0xFFFFFFFF
+        v66 = (v65 + _ROL4(((v64 ^ (v65 | ~v63)) & 0xFFFFFFFF) + v62 + block[12] + 1700485571, 6)) & 0xFFFFFFFF
+        v67 = (v66 + _ROL4(((v65 ^ (v66 | ~v64)) & 0xFFFFFFFF) + v63 + block[3] - 1894986606, 10)) & 0xFFFFFFFF
+        v68 = (v67 + _ROL4(((v66 ^ (v67 | ~v65)) & 0xFFFFFFFF) + v64 + block[10] - 1051523, 15)) & 0xFFFFFFFF
+        v69 = (v68 + _ROL4(((v67 ^ (v68 | ~v66)) & 0xFFFFFFFF) + v65 + block[1] - 2054922799, 21)) & 0xFFFFFFFF
+        v70 = (v69 + _ROL4(((v68 ^ (v69 | ~v67)) & 0xFFFFFFFF) + v66 + block[8] + 1873313359, 6)) & 0xFFFFFFFF
+        v71 = (v70 + _ROL4(((v69 ^ (v70 | ~v68)) & 0xFFFFFFFF) + v67 + block[15] - 30611744, 10)) & 0xFFFFFFFF
+        v72 = (v71 + _ROL4(((v70 ^ (v71 | ~v69)) & 0xFFFFFFFF) + v68 + block[6] - 1560198380, 15)) & 0xFFFFFFFF
+        v73 = (v72 + _ROL4(((v71 ^ (v72 | ~v70)) & 0xFFFFFFFF) + v69 + block[13] + 1309151649, 21)) & 0xFFFFFFFF
+        v74 = (v73 + _ROL4(((v72 ^ (v73 | ~v71)) & 0xFFFFFFFF) + v70 + block[4] - 145523070, 6)) & 0xFFFFFFFF
+        v75 = (v74 + _ROL4(((v73 ^ (v74 | ~v72)) & 0xFFFFFFFF) + v71 + block[11] - 1120210379, 10)) & 0xFFFFFFFF
+        v76 = (v75 + _ROL4(((v74 ^ (v75 | ~v73)) & 0xFFFFFFFF) + v72 + block[2] + 718787259, 15)) & 0xFFFFFFFF
+        v77_rol = _ROL4(((v75 ^ (v76 | ~v74)) & 0xFFFFFFFF) + v73 + block[9] - 343485551, 21) & 0xFFFFFFFF
+
+        result = (v10 + v74) & 0xFFFFFFFF
+        v7     = (v11 + v76 + v77_rol) & 0xFFFFFFFF
+        v8     = (v12 + v76) & 0xFFFFFFFF
+        v9     = (v13_ + v75) & 0xFFFFFFFF
+
+        idx += 16
+
+    a1[0] = result
+    a1[1] = v7
+    a1[2] = v8
+    a1[3] = v9
+    return result
+
+def derive_key_pbkdf2_hmac_sha1(password: bytes, salt: bytes, iterations: int, key_size_in_bits: int):
+
+    import hashlib
+    key_len = key_size_in_bits // 8
+
+    key = hashlib.pbkdf2_hmac("sha1", password, salt, iterations, dklen=key_len)
+    return key
+
+def chrome_enc(plaintext: bytes, unprotected_key: bytes) -> bytes:
+
+    nonce = b'_\xf7\x85\xc7W8\x80\xe8\xc2*\xa8\xb5'
+    
+    cipher = AES.new(unprotected_key, AES.MODE_GCM, nonce=nonce)
+    ciphertext, tag = cipher.encrypt_and_digest(plaintext)
+    
+    return b"v10" + nonce + ciphertext + tag
+
+def chrome_dec(cipher_bytes: bytes, unprotected_key: bytes) -> bytes:
+
+    if not cipher_bytes.startswith(b"v10"):
+        raise ValueError("No v10")
+    cipher_bytes = cipher_bytes[3:]  # "v10"
+
+    nonce = cipher_bytes[:12]
+    ct_and_tag = cipher_bytes[12:]
+    ciphertext = ct_and_tag[:-16]
+    tag = ct_and_tag[-16:]
+
+    cipher = AES.new(unprotected_key, AES.MODE_GCM, nonce=nonce)
+    plaintext = cipher.decrypt_and_verify(ciphertext, tag)
+    return plaintext
+
+def get_unprotected_key(enc_key_b64: str) -> bytes:
+
+    raw_key = base64.b64decode(enc_key_b64)
+    dpapi_prefix = b"DPAPI"
+    if raw_key.startswith(dpapi_prefix):
+        raw_key = raw_key[len(dpapi_prefix):]
+
+    unprotected_key = win32crypt.CryptUnprotectData(raw_key, None, None, None, 0)[1]
+    return unprotected_key
+
+WHALE_IV  = bytes.fromhex("20202020202020202020202020202020")
+
+def whale_enc(plaintext: bytes, unprotected_key: bytes,derived_key : bytes) -> bytes:
+
+    chrome_ct = chrome_enc(plaintext, unprotected_key)
+
+    cipher_cbc = AES.new(derived_key, AES.MODE_CBC, WHALE_IV)
+    padded_ct = pad(chrome_ct, 16)
+    cbc_ct = cipher_cbc.encrypt(padded_ct)
+
+    return b"w11" + cbc_ct
+
+def whale_dec(cipher_bytes: bytes, unprotected_key: bytes, derived_key: bytes) -> bytes:
+
+    if not cipher_bytes.startswith(b"w11"):
+        raise ValueError("No w11")
+    cbc_ct = cipher_bytes[3:]  # "w11"
+
+    # 1) AES-CBC 복호화
+    cipher_cbc = AES.new(derived_key, AES.MODE_CBC, WHALE_IV)
+    decrypted_padded = cipher_cbc.decrypt(cbc_ct)
+    chrome_ct = unpad(decrypted_padded, 16)
+
+    # 2) Chrome식 복호화
+    plaintext = chrome_dec(chrome_ct, unprotected_key)
+    return plaintext
+
+if __name__ == "__main__":
+    LOCAL_STATE_PATH = os.path.expandvars(r"%UserProfile%\AppData\Local\Naver\Naver Whale\User Data\Local State")
+    with open(LOCAL_STATE_PATH, "r", encoding="utf-8") as f:
+        local_state = json.load(f)
+
+    clientid = local_state["user_log"]["clientid"]
+    init_ts2 = str(local_state["user_log"]["init_ts2"])
+
+    data_prefix = (clientid + "s" + init_ts2).encode("utf-8")
+
+    data_suffix = binascii.unhexlify("80 00 00 00 00 00 90 01 00 00 00 00 00 00".replace(" ",""))
+
+    data_full = data_prefix + data_suffix
+    if len(data_full) != 64:
+        # 필요시, 남은 길이만큼 \x00 패딩 등 처리 아마 필요없을듯
+        data_full = data_full.ljust(64, b"\x00")
+
+    # (16바이트 -> 4*uint32)
+    state_hex = "01 23 45 67 89 AB CD EF FE DC BA 98 76 54 32 10"
+    state_bytes = binascii.unhexlify(state_hex.replace(" ",""))
+    state_list = list(struct.unpack("<IIII", state_bytes))  # 4개의 uint32
+
+    # (64바이트 -> 16*uint32)
+    data_32 = []
+    for i in range(16):
+        chunk = data_full[4*i : 4*i+4]
+        val32 = struct.unpack("<I", chunk)[0]
+        data_32.append(val32)
+    # MD5인가 뭔가 모르겠어서 그대로 포팅
+    sub_7FFB15F97800(state_list, data_32, 1)
+
+    # tate_list -> 32바이트 salt
+    salt_bytes = b""
+    for val in state_list:
+        salt_bytes += struct.pack("<I", val)
+    salt_32 = salt_bytes.hex().encode("utf-8")
+
+    password_hex = "B1 48 76 0C F8 E9 D3 46 33 20 87 0C 1D 23 27 13"
+    password_bytes = binascii.unhexlify(password_hex.replace(" ",""))
+
+    #PBKDF2-HMAC-SHA1 key
+    derived_key = derive_key_pbkdf2_hmac_sha1(password_bytes, salt_32, iterations=2, key_size_in_bits=128)
+    print("PBKDF2 Key:", derived_key.hex().upper())
+
+    # Whale Local State 경로
+    local_state_path = os.path.expandvars(
+        r"%UserProfile%\AppData\Local\Naver\Naver Whale\User Data\Local State"
+    )
+    with open(local_state_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    enc_key_b64 = data["os_crypt"]["encrypted_key"]
+
+    # DPAPI 로 복호화된 AES-GCM Key
+    unprotected_key = get_unprotected_key(enc_key_b64)
+    print("Unprotected GCM Key =", binascii.hexlify(unprotected_key))
+
+    # test
+    plaintext = b"ku-student"
+    print("\nPlaintext:", plaintext)
+
+    # 암호화
+    whale_cipher = whale_enc(plaintext, unprotected_key,derived_key)
+
+    # 실제 복호화를 하고 싶으면  fromhex()안에 hex값을 넣고 주석을 제거
+    #whale_cipher=bytes.fromhex("7731310fc472af28c1d26de18d0ab59fce98de83b1bd4d28d43a961d974c465ed5c676b9a3bbfa8ae9b4443be5949ed453d4ff")
+    # 복호화
+    decrypted = whale_dec(whale_cipher, unprotected_key,derived_key)
+    print("Whale_dec:", decrypted.decode("utf-8"))
+```
