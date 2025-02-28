@@ -4,7 +4,9 @@ email: jsw5203@gmail.com
 description: >- 
   hi
 baseurl: "" # 서브 경로가 있는 경우 "/blog"와 같이 설정
-url: "" # 도메인 주소 (예: "https://example.com")
+url: "https://keto0422.github.io" # 사이트 URL
+
+
 
 # 소셜 미디어 정보
 twitter_username: 
